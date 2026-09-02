@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flight radar POC — Praha</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2a3a4d;
+      --text: #e8eef5;
+      --muted: #8b9bb0;
+      --accent: #4fc3f7;
+      --air: #22c55e;
+      --high: #eab308;
+      --ground: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    body {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      height: 100%;
+    }
+    aside {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      overflow: auto;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+    p.hint {
+      margin: 0;
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    code {
+      font-size: 0.75rem;
+      color: var(--accent);
+    }
+    textarea {
+      flex: 1;
+      min-height: 180px;
+      resize: vertical;
+      background: #0c1117;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 0.75rem;
+      line-height: 1.35;
+    }
+    textarea:focus {
+      outline: 1px solid var(--accent);
+    }
+    select {
+      width: 100%;
+      padding: 8px 10px;
+      background: #0c1117;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.8rem;
+    }
+    select:focus { outline: 1px solid var(--accent); }
+    select:disabled { opacity: 0.65; }
+    .block {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 4px;
+      border-top: 1px solid var(--border);
+    }
+    .block-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+    }
+    button {
+      flex: 1;
+      padding: 8px 12px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #06202b;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: #2a3a4d;
+      color: var(--text);
+    }
+    button:hover { filter: brightness(1.08); }
+    #status {
+      font-size: 0.8rem;
+      color: var(--muted);
+      min-height: 1.2em;
+    }
+    #status.error { color: #ff7b7b; }
+    #map { height: 100%; width: 100%; background: #1a2332; }
+    .leaflet-tooltip.ac-tip {
+      background: #0c1117;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+    .leaflet-tooltip.ac-tip::before { border-top-color: #0c1117; }
+    .ac-tip strong { color: var(--air); }
+    .ac-tip .row { color: var(--muted); font-size: 12px; }
+    .legend {
+      font-size: 0.75rem;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+    }
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 5px;
+      vertical-align: middle;
+    }
+    .legend .air::before { background: var(--air); }
+    .legend .high::before { background: var(--high); }
+    .legend .gnd::before { background: var(--ground); }
+    .ac-icon {
+      background: none !important;
+      border: none !important;
+      pointer-events: none;
+    }
+    .ac-icon svg { display: block; overflow: visible; }
+    .ac-icon .plane { pointer-events: auto; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Flight radar POC</h1>
+    <p class="hint">
+      Mapa: Praha a okolí<br>
+      <code>lat 48.4–51.2</code> · <code>lon 11.8–19.0</code>
+    </p>
+    <div class="block">
+      <div class="block-title">Nahrát Snapshot</div>
+      <select id="snapshot" disabled>
+        <option value="">Načítám snapshoty…</option>
+      </select>
+      <button id="load-snapshot" class="secondary" disabled>Nahrát Snapshot</button>
+    </div>
+    <p class="hint">
+      Nebo vlož výstup z OpenSky <code>/states/all</code> — JSON i Python <code>print(data)</code>
+      (jednoduché uvozovky, <code>None</code>/<code>True</code>/<code>False</code>).
+    </p>
+    <textarea id="json" placeholder='{"time": ..., "states": [ ... ]}'></textarea>
+    <div class="actions">
+      <button id="plot">Zobrazit na mapě</button>
+      <button id="clear" class="secondary">Vymazat</button>
+    </div>
+    <div id="status"></div>
+    <div class="legend">
+      <span class="air">ve vzduchu</span>
+      <span class="high">vysoko</span>
+      <span class="gnd">na zemi</span>
+    </div>
+    <p class="hint">vysoko = výška ≥ 6000 m (cca FL195)</p>
+  </aside>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const BBOX = { lamin: 48.4, lamax: 51.2, lomin: 11.8, lomax: 19.0 };
+    const HIGH_ALT_M = 6000;
+    const COLOR = { air: "#22c55e", high: "#eab308", ground: "#ef4444" };
+    const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8765" : "";
+
+    const FIELDS = [
+      "icao24", "callsign", "origin_country", "time_position", "last_contact",
+      "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
+      "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
+      "spi", "position_source", "category",
+    ];
+
+    const map = L.map("map", { zoomControl: true });
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "&copy; OpenStreetMap",
+      maxZoom: 19,
+    }).addTo(map);
+
+    const bounds = L.latLngBounds(
+      [BBOX.lamin, BBOX.lomin],
+      [BBOX.lamax, BBOX.lomax],
+    );
+    map.fitBounds(bounds, { padding: [12, 12] });
+
+    L.rectangle(bounds, {
+      color: "#F52746",
+      weight: 1,
+      fill: false,
+      dashArray: "6 4",
+    }).addTo(map);
+
+    const layer = L.layerGroup().addTo(map);
+
+    function fmt(value, unit, digits = 0) {
+      if (value == null || Number.isNaN(value)) return "—";
+      return `${Number(value).toFixed(digits)} ${unit}`;
+    }
+
+    function fmtTime(value) {
+      if (value == null || value === "") return "—";
+      if (typeof value === "string") {
+        const trimmed = value.replace(/\.0+$/, "").trim();
+        return /UTC$/i.test(trimmed) ? trimmed : `${trimmed} UTC`;
+      }
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "—";
+      return new Date(n * 1000).toISOString().replace("T", " ").replace(".000Z", " UTC");
+    }
+
+    function altitudeOf(ac) {
+      const alt = ac.geo_altitude ?? ac.baro_altitude;
+      return alt == null || Number.isNaN(Number(alt)) ? null : Number(alt);
+    }
+
+    function isHigh(ac) {
+      if (ac.on_ground) return false;
+      const alt = altitudeOf(ac);
+      return alt != null && alt >= HIGH_ALT_M;
+    }
+
+    function aircraftColor(ac) {
+      if (ac.on_ground) return COLOR.ground;
+      return isHigh(ac) ? COLOR.high : COLOR.air;
+    }
+
+    function bandLabel(ac) {
+      if (ac.on_ground) return "na zemi";
+      return isHigh(ac) ? "vysoko" : "ve vzduchu";
+    }
+
+    function planeIcon(heading, onGround, color) {
+      const rot = heading == null ? 0 : heading;
+      const plane = `M12 2 L15.2 10.2 L22 12 L15.2 13.8 L12 22 L8.8 13.8 L2 12 L8.8 10.2 Z`;
+
+      if (onGround) {
+        const svg = encodeURIComponent(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24">
+            <g transform="rotate(${rot} 12 12)">
+              <path fill="${color}" d="${plane}"/>
+            </g>
+          </svg>`
+        );
+        return L.icon({
+          iconUrl: `data:image/svg+xml,${svg}`,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+          tooltipAnchor: [0, -14],
+        });
+      }
+
+      const icon = 28;
+      const front = (icon * 3) * (2 / 3) / 2;
+      const half = icon / 2;
+      const arrow = 8;
+      const pad = 8;
+      const size = (half + front + pad) * 2;
+      const c = size / 2;
+      const nose = -half;
+      const tip = nose - front;
+
+      const svg = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+          <g transform="translate(${c} ${c}) rotate(${rot})">
+            <line x1="0" y1="${nose}" x2="0" y2="${tip + arrow}" stroke="#062010" stroke-width="3.5" stroke-linecap="round"/>
+            <line x1="0" y1="${nose}" x2="0" y2="${tip + arrow}" stroke="${color}" stroke-width="2" stroke-linecap="round"/>
+            <path d="M 0 ${tip} L ${-arrow * 0.65} ${tip + arrow} L ${arrow * 0.65} ${tip + arrow} Z" fill="#062010"/>
+            <path d="M 0 ${tip + 1.2} L ${-arrow * 0.5} ${tip + arrow - 0.4} L ${arrow * 0.5} ${tip + arrow - 0.4} Z" fill="${color}"/>
+            <g transform="scale(${icon / 24}) translate(-12 -12)">
+              <path class="plane" fill="${color}" stroke="#062010" stroke-width="0.7" d="${plane}"/>
+            </g>
+          </g>
+        </svg>`;
+
+      return L.divIcon({
+        className: "ac-icon",
+        html: svg,
+        iconSize: [size, size],
+        iconAnchor: [c, c],
+        tooltipAnchor: [0, -half],
+      });
+    }
+
+    function parseAircraft(state) {
+      const ac = {};
+      FIELDS.forEach((name, i) => { ac[name] = state[i] ?? null; });
+      if (typeof ac.callsign === "string") ac.callsign = ac.callsign.trim() || "UNKNOWN";
+      return ac;
+    }
+
+    function tooltipHtml(ac) {
+      const alt = altitudeOf(ac);
+      const spdKt = ac.velocity != null ? ac.velocity * 1.94384 : null;
+      const color = aircraftColor(ac);
+      return `
+        <strong style="color:${color}">${ac.callsign || "UNKNOWN"}</strong>
+        <div class="row">icao24: ${ac.icao24 || "—"}</div>
+        <div class="row">${ac.origin_country || "—"} · ${bandLabel(ac)}</div>
+        <div class="row">lat ${ac.latitude?.toFixed(4) ?? "—"} · lon ${ac.longitude?.toFixed(4) ?? "—"}</div>
+        <div class="row">výška ${fmt(alt, "m")} · squawk ${ac.squawk || "—"}</div>
+        <div class="row">rychlost ${fmt(spdKt, "kt", 0)} · kurz ${fmt(ac.true_track, "°", 0)}</div>
+        <div class="row">v/s ${fmt(ac.vertical_rate, "m/s", 1)}</div>
+        <div class="row">pos ${fmtTime(ac.time_position)}</div>
+      `;
+    }
+
+    function setStatus(text, isError = false) {
+      const el = document.getElementById("status");
+      el.textContent = text;
+      el.classList.toggle("error", isError);
+    }
+
+    function plot(payload) {
+      layer.clearLayers();
+      const states = payload.states || [];
+      let shown = 0;
+      let skipped = 0;
+
+      for (const state of states) {
+        const ac = parseAircraft(state);
+        if (ac.latitude == null || ac.longitude == null) {
+          skipped += 1;
+          continue;
+        }
+        const marker = L.marker([ac.latitude, ac.longitude], {
+          icon: planeIcon(ac.true_track, ac.on_ground, aircraftColor(ac)),
+          rotationAngle: ac.true_track || 0,
+        });
+        marker.bindTooltip(tooltipHtml(ac), {
+          className: "ac-tip",
+          direction: "top",
+          sticky: true,
+          opacity: 0.96,
+        });
+        marker.addTo(layer);
+        shown += 1;
+      }
+
+      const when = payload.time ? ` · snapshot ${fmtTime(payload.time)}` : "";
+      setStatus(`${shown} letadel na mapě` + (skipped ? `, ${skipped} bez pozice` : "") + when);
+    }
+
+    function pythonishToJson(text) {
+      return text
+        .replace(/\bNone\b/g, "null")
+        .replace(/\bTrue\b/g, "true")
+        .replace(/\bFalse\b/g, "false")
+        .replace(/'/g, '"');
+    }
+
+    function parsePayload(raw) {
+      let parsed = null;
+      let lastErr = null;
+      for (const text of [raw, pythonishToJson(raw)]) {
+        try {
+          parsed = JSON.parse(text);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (lastErr) throw lastErr;
+      if (Array.isArray(parsed)) return { time: null, states: parsed };
+      if (parsed && Array.isArray(parsed.states)) return parsed;
+      throw new Error('Očekávám objekt s polem "states" (nebo seznam letadel).');
+    }
+
+    document.getElementById("plot").addEventListener("click", () => {
+      const raw = document.getElementById("json").value.trim();
+      if (!raw) {
+        setStatus("Vlož JSON z API.", true);
+        return;
+      }
+      try {
+        plot(parsePayload(raw));
+      } catch (err) {
+        setStatus("Neplatný JSON: " + err.message, true);
+      }
+    });
+
+    document.getElementById("clear").addEventListener("click", () => {
+      layer.clearLayers();
+      document.getElementById("json").value = "";
+      const sel = document.getElementById("snapshot");
+      if (sel.options.length && sel.options[0].value === "") sel.selectedIndex = 0;
+      document.getElementById("load-snapshot").disabled = !sel.value;
+      setStatus("");
+    });
+
+    async function loadSnapshot(time) {
+      try {
+        const res = await fetch(`${API_BASE}/api/snapshot?time=${encodeURIComponent(time)}`);
+        if (!res.ok) throw new Error(res.statusText);
+        plot(await res.json());
+      } catch (err) {
+        setStatus("Snapshot se nepodařilo načíst: " + err.message, true);
+      }
+    }
+
+    async function loadSnapshotList() {
+      const sel = document.getElementById("snapshot");
+      const btn = document.getElementById("load-snapshot");
+      try {
+        const res = await fetch(`${API_BASE}/api/snapshots`);
+        if (!res.ok) throw new Error(res.statusText);
+        const items = await res.json();
+        sel.innerHTML = "";
+        const placeholder = document.createElement("option");
+        placeholder.value = "";
+        placeholder.textContent = items.length ? "— vyber snapshot —" : "Žádné uložené snapshoty";
+        sel.appendChild(placeholder);
+        for (const item of items) {
+          const opt = document.createElement("option");
+          opt.value = item.time;
+          const label = fmtTime(item.time).replace(/ UTC$/, "");
+          opt.textContent = `${label} · ${item.count} letadel`;
+          sel.appendChild(opt);
+        }
+        sel.disabled = items.length === 0;
+        btn.disabled = true;
+      } catch (err) {
+        sel.innerHTML = "";
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "Server neběží — spusť map_server.py";
+        sel.appendChild(opt);
+        sel.disabled = true;
+        btn.disabled = true;
+      }
+    }
+
+    document.getElementById("snapshot").addEventListener("change", (event) => {
+      const time = event.target.value;
+      document.getElementById("load-snapshot").disabled = !time;
+      if (time) loadSnapshot(time);
+    });
+
+    document.getElementById("load-snapshot").addEventListener("click", () => {
+      const time = document.getElementById("snapshot").value;
+      if (time) loadSnapshot(time);
+    });
+
+    loadSnapshotList();
+  </script>
+</body>
+</html>
