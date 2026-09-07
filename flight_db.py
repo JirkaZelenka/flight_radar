@@ -113,6 +113,49 @@ DEFAULT_STATES_PARAMS: dict[str, Any] = {
     "extended": 1,  # včetně aircraft category
 }
 
+BBOX_PRAHA: dict[str, float] = {
+    "lamin": 49.8,
+    "lamax": 50.5,
+    "lomin": 13.8,
+    "lomax": 15.0,
+}
+BBOX_CR: dict[str, float] = {
+    "lamin": 48.4,
+    "lamax": 51.2,
+    "lomin": 11.8,
+    "lomax": 19.0,
+}
+REGIONS: dict[str, dict[str, float]] = {
+    "ČR": BBOX_CR,
+    "Praha": BBOX_PRAHA,
+}
+
+# OpenSky ADS-B emitter category
+# https://openskynetwork.github.io/opensky-api/rest.html
+CATEGORY_NAMES: dict[int, str] = {
+    0: "bez informace",
+    1: "bez ADS-B kategorie",
+    2: "Light (<15 500 lbs)",
+    3: "Small (15 500–75 000 lbs)",
+    4: "Large (75 000–300 000 lbs)",
+    5: "High Vortex Large (např. B-757)",
+    6: "Heavy (>300 000 lbs)",
+    7: "High Performance (>5g / 400 kt)",
+    8: "Rotorcraft",
+    9: "Kluzák",
+    10: "Lighter-than-air",
+    11: "Parašutista",
+    12: "Ultralight / hang-glider",
+    13: "Reserved",
+    14: "UAV",
+    15: "Space / transatmospheric",
+    16: "Pozemní — emergency",
+    17: "Pozemní — servis",
+    18: "Point obstacle",
+    19: "Cluster obstacle",
+    20: "Line obstacle",
+}
+
 
 def format_timestamp(value: Any) -> str | None:
     """Unix timestamp / datetime / ISO string -> '2026-07-29 20:17:06.395581' (UTC)."""
@@ -535,6 +578,351 @@ def format_state_line(parsed: dict[str, Any]) -> str:
     )
 
 
+def _in_bbox(lat: Any, lon: Any, bbox: dict[str, float]) -> bool:
+    if lat is None or lon is None:
+        return False
+    try:
+        latitude = float(lat)
+        longitude = float(lon)
+    except (TypeError, ValueError):
+        return False
+    return (
+        bbox["lamin"] <= latitude <= bbox["lamax"]
+        and bbox["lomin"] <= longitude <= bbox["lomax"]
+    )
+
+
+def _bbox_sql(prefix: str = "") -> str:
+    p = f"{prefix}." if prefix else ""
+    return (
+        f"{p}latitude IS NOT NULL AND {p}longitude IS NOT NULL "
+        f"AND {p}latitude BETWEEN :lamin AND :lamax "
+        f"AND {p}longitude BETWEEN :lomin AND :lomax"
+    )
+
+
+def _cruise_altitude(parsed: dict[str, Any]) -> float | None:
+    """Cestovní výška: geo, jinak baro; jen letadla ve vzduchu."""
+    if parsed.get("on_ground") in (1, True):
+        return None
+    for key in ("geo_altitude", "baro_altitude"):
+        value = parsed.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _format_category(category: Any) -> str:
+    if category is None:
+        return "—"
+    try:
+        cat = int(category)
+    except (TypeError, ValueError):
+        return str(category)
+    name = CATEGORY_NAMES.get(cat)
+    return f"{cat} {name}" if name else str(cat)
+
+
+def _format_speed(velocity: float | None) -> str:
+    if velocity is None:
+        return "—"
+    return f"{velocity:.2f} m/s ({velocity * 3.6:.0f} km/h)"
+
+
+def _format_altitude(altitude: float | None) -> str:
+    if altitude is None:
+        return "—"
+    return f"{altitude:.1f} m"
+
+
+def _aircraft_label(row: dict[str, Any] | sqlite3.Row | None) -> str:
+    if row is None:
+        return "—"
+    callsign = (row["callsign"] or "UNKNOWN") if "callsign" in row.keys() else "UNKNOWN"
+    return f"{callsign.strip():10} {row['icao24']}"
+
+
+def _row_to_holder(row: sqlite3.Row | None, value_key: str) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "icao24": row["icao24"],
+        "callsign": row["callsign"],
+        "value": row[value_key],
+        "snapshot_time": row["snapshot_time"] if "snapshot_time" in row.keys() else None,
+    }
+
+
+def _query_region_stats(
+    conn: sqlite3.Connection,
+    bbox: dict[str, float],
+) -> dict[str, Any]:
+    """Globální extrémy a počty pro jeden bbox z celé DB."""
+    where = _bbox_sql()
+    icao_rows = conn.execute(
+        f"SELECT DISTINCT icao24 FROM observations WHERE {where}",
+        bbox,
+    ).fetchall()
+    icao24s = {row["icao24"] for row in icao_rows}
+
+    multi_seen = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM (
+            SELECT icao24 FROM observations
+            WHERE {where}
+            GROUP BY icao24
+            HAVING COUNT(*) > 1
+        )
+        """,
+        bbox,
+    ).fetchone()[0]
+
+    observation_count = conn.execute(
+        f"SELECT COUNT(*) FROM observations WHERE {where}",
+        bbox,
+    ).fetchone()[0]
+
+    categories = {
+        int(row["category"])
+        for row in conn.execute(
+            f"""
+            SELECT DISTINCT category FROM observations
+            WHERE category IS NOT NULL AND {where}
+            """,
+            bbox,
+        )
+        if row["category"] is not None
+    }
+
+    speed_row = conn.execute(
+        f"""
+        SELECT icao24, callsign, velocity, snapshot_time
+        FROM observations
+        WHERE velocity IS NOT NULL AND {where}
+        ORDER BY velocity DESC
+        LIMIT 1
+        """,
+        bbox,
+    ).fetchone()
+
+    alt_row = conn.execute(
+        f"""
+        SELECT icao24, callsign, snapshot_time,
+               COALESCE(geo_altitude, baro_altitude) AS altitude
+        FROM observations
+        WHERE COALESCE(on_ground, 0) = 0
+          AND COALESCE(geo_altitude, baro_altitude) IS NOT NULL
+          AND {where}
+        ORDER BY altitude DESC
+        LIMIT 1
+        """,
+        bbox,
+    ).fetchone()
+
+    return {
+        "icao24s": icao24s,
+        "aircraft_count": len(icao24s),
+        "multi_seen": multi_seen,
+        "observation_count": observation_count,
+        "categories": categories,
+        "max_speed": _row_to_holder(speed_row, "velocity"),
+        "max_altitude": _row_to_holder(alt_row, "altitude"),
+    }
+
+
+def collect_region_baselines(db_path: Path | str = DB_PATH) -> dict[str, dict[str, Any]]:
+    """Stav ČR / Praha před ingestem — pro detekci nových letadel a rekordů."""
+    conn = init_db(db_path)
+    try:
+        return {name: _query_region_stats(conn, bbox) for name, bbox in REGIONS.items()}
+    finally:
+        conn.close()
+
+
+def compare_fetch_to_baseline(
+    parsed: list[dict[str, Any]],
+    baselines: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Porovná jeden snapshot s baseline: nová letadla a rekordy po regionech."""
+    result: dict[str, dict[str, Any]] = {}
+    for name, bbox in REGIONS.items():
+        base = baselines[name]
+        in_region = [
+            row
+            for row in parsed
+            if _in_bbox(row.get("latitude"), row.get("longitude"), bbox)
+        ]
+        icaos = {row["icao24"] for row in in_region}
+        known = base["icao24s"]
+        new_icaos = sorted(icaos - known)
+        repeat_icaos = sorted(icaos & known)
+
+        cats_now = {
+            int(row["category"])
+            for row in in_region
+            if row.get("category") is not None
+        }
+        new_categories = []
+        for cat in sorted(cats_now - base["categories"]):
+            sample = next(
+                (row for row in in_region if row.get("category") == cat),
+                None,
+            )
+            new_categories.append({"category": cat, "sample": sample})
+
+        speed_best = None
+        for row in in_region:
+            velocity = row.get("velocity")
+            if velocity is None:
+                continue
+            if speed_best is None or velocity > speed_best["value"]:
+                speed_best = {
+                    "icao24": row["icao24"],
+                    "callsign": row.get("callsign"),
+                    "value": float(velocity),
+                }
+
+        alt_best = None
+        for row in in_region:
+            altitude = _cruise_altitude(row)
+            if altitude is None:
+                continue
+            if alt_best is None or altitude > alt_best["value"]:
+                alt_best = {
+                    "icao24": row["icao24"],
+                    "callsign": row.get("callsign"),
+                    "value": altitude,
+                }
+
+        prev_speed = (base["max_speed"] or {}).get("value")
+        speed_record = None
+        if speed_best is not None and (
+            prev_speed is None or speed_best["value"] > prev_speed
+        ):
+            speed_record = {"now": speed_best, "previous": base["max_speed"]}
+
+        prev_alt = (base["max_altitude"] or {}).get("value")
+        altitude_record = None
+        if alt_best is not None and (prev_alt is None or alt_best["value"] > prev_alt):
+            altitude_record = {"now": alt_best, "previous": base["max_altitude"]}
+
+        result[name] = {
+            "count": len(in_region),
+            "new": len(new_icaos),
+            "new_icao24s": new_icaos,
+            "repeat": len(repeat_icaos),
+            "repeat_icao24s": repeat_icaos,
+            "new_categories": new_categories,
+            "speed_record": speed_record,
+            "altitude_record": altitude_record,
+        }
+    return result
+
+
+def _print_record_block(region_stats: dict[str, Any], indent: str = "  ") -> None:
+    new_categories = region_stats.get("new_categories") or []
+    speed_record = region_stats.get("speed_record")
+    altitude_record = region_stats.get("altitude_record")
+    if not new_categories and not speed_record and not altitude_record:
+        print(f"{indent}žádný rekord")
+        return
+
+    for item in new_categories:
+        sample = item.get("sample")
+        print(
+            f"{indent}nová kategorie: {_format_category(item['category'])}"
+            f"  ({_aircraft_label(sample)})"
+        )
+
+    if speed_record:
+        now = speed_record["now"]
+        previous = speed_record["previous"]
+        prev_txt = (
+            f"  (bylo {_format_speed(previous['value'])}, {_aircraft_label(previous)})"
+            if previous
+            else "  (první hodnota)"
+        )
+        print(
+            f"{indent}nová max rychlost: {_format_speed(now['value'])}"
+            f"  {_aircraft_label(now)}{prev_txt}"
+        )
+
+    if altitude_record:
+        now = altitude_record["now"]
+        previous = altitude_record["previous"]
+        prev_txt = (
+            f"  (bylo {_format_altitude(previous['value'])}, {_aircraft_label(previous)})"
+            if previous
+            else "  (první hodnota)"
+        )
+        print(
+            f"{indent}nová max cestovní výška: {_format_altitude(now['value'])}"
+            f"  {_aircraft_label(now)}{prev_txt}"
+        )
+
+
+def print_fetch_stats(fetch_stats: dict[str, dict[str, Any]]) -> None:
+    """Výpis statistik posledního fetche: nová letadla a rekordy, ČR vs Praha."""
+    print("=== ČR vs Praha — tento fetch ===")
+    for name in REGIONS:
+        stats = fetch_stats[name]
+        print(
+            f"{name + ':':7} v bbox={stats['count']:<4}  "
+            f"nových={stats['new']:<4}  "
+            f"zachyceno znovu={stats['repeat']}"
+        )
+
+    for name in REGIONS:
+        print(f"{name} rekordy:")
+        _print_record_block(fetch_stats[name])
+
+
+def get_global_stats(db_path: Path | str = DB_PATH) -> dict[str, dict[str, Any]]:
+    """Globální počty a extrémy z celé DB, ne z posledního fetche."""
+    return collect_region_baselines(db_path)
+
+
+def print_global_stats(db_path: Path | str = DB_PATH) -> dict[str, dict[str, Any]]:
+    """Vypíše globální stats a extrémy (ČR vs Praha) z celé SQLite DB."""
+    stats = get_global_stats(db_path)
+    print("=== Globální stats a extrémy ===")
+    for name in REGIONS:
+        region = stats[name]
+        print(
+            f"{name + ':':7} letadel={region['aircraft_count']:<5}  "
+            f"zachyceno vícekrát={region['multi_seen']:<5}  "
+            f"pozorování={region['observation_count']}"
+        )
+
+    for name in REGIONS:
+        region = stats[name]
+        cats = ", ".join(_format_category(cat) for cat in sorted(region["categories"]))
+        print(f"\n{name}")
+        print(f"  kategorie: {cats or '—'}")
+        speed = region["max_speed"]
+        alt = region["max_altitude"]
+        if speed:
+            when = f"  {speed['snapshot_time']}" if speed.get("snapshot_time") else ""
+            print(
+                f"  max rychlost: {_format_speed(speed['value'])}"
+                f"  {_aircraft_label(speed)}{when}"
+            )
+        else:
+            print("  max rychlost: —")
+        if alt:
+            when = f"  {alt['snapshot_time']}" if alt.get("snapshot_time") else ""
+            print(
+                f"  max cestovní výška: {_format_altitude(alt['value'])}"
+                f"  {_aircraft_label(alt)}{when}"
+            )
+        else:
+            print("  max cestovní výška: —")
+    return stats
+
+
 def _load_dotenv(path: Path | str = ENV_PATH) -> None:
     """Načte KEY=VALUE z .env do os.environ (existující env má přednost)."""
     env_file = Path(path)
@@ -672,6 +1060,7 @@ class OpenSkyClient:
         self.tokens = get_tokens()
         self.last_data: dict[str, Any] | None = None
         self.last_stats: dict[str, Any] | None = None
+        self.last_fetch_stats: dict[str, dict[str, Any]] | None = None
         self.last_rate_limit: dict[str, Any] | None = None
 
     def _get_states(self) -> requests.Response:
@@ -697,8 +1086,13 @@ class OpenSkyClient:
         self.last_data = data
 
         if self.save_to_db:
+            baselines = collect_region_baselines(self.db_path)
             stats = ingest_states(data, db_path=self.db_path)
             stats["saved_to_db"] = True
+            fetch_stats = compare_fetch_to_baseline(self.parsed_states(data), baselines)
+            stats["region_stats"] = fetch_stats
+            self.last_fetch_stats = fetch_stats
+            print_fetch_stats(fetch_stats)
         else:
             states = data.get("states") or []
             stats = {
@@ -709,6 +1103,7 @@ class OpenSkyClient:
                 "observations_skipped": 0,
                 "saved_to_db": False,
             }
+            self.last_fetch_stats = None
 
         stats["rate_limit"] = self.last_rate_limit
         self.last_stats = stats
@@ -742,6 +1137,10 @@ class OpenSkyClient:
         if extra:
             for key, value in extra.items():
                 print(f"  {key}: {value}")
+
+    def print_global_stats(self) -> dict[str, dict[str, Any]]:
+        """Globální stats a extrémy z DB (ne z posledního fetche)."""
+        return print_global_stats(self.db_path)
 
     def parsed_states(self, data: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         payload = data if data is not None else self.last_data
