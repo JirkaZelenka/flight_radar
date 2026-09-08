@@ -1005,6 +1005,11 @@ class TokenManager:
             return self.token
         return self._refresh()
 
+    def invalidate(self) -> None:
+        """Drop the cached token so the next call fetches a new one."""
+        self.token = None
+        self.expires_at = None
+
     def _refresh(self) -> str:
         """Fetch a new access token from the OpenSky authentication server."""
         response = requests.post(
@@ -1019,10 +1024,10 @@ class TokenManager:
         response.raise_for_status()
         data = response.json()
         self.token = data["access_token"]
-        expires_in = data.get("expires_in", 1800)
-        self.expires_at = datetime.now() + timedelta(
-            seconds=expires_in - TOKEN_REFRESH_MARGIN
-        )
+        expires_in = int(data.get("expires_in", 1800))
+        # Never schedule expiry in the past if the server sends a short TTL.
+        refresh_after = max(1, expires_in - TOKEN_REFRESH_MARGIN)
+        self.expires_at = datetime.now() + timedelta(seconds=refresh_after)
         return self.token
 
     def headers(self) -> dict[str, str]:
@@ -1063,7 +1068,7 @@ class OpenSkyClient:
         self.last_fetch_stats: dict[str, dict[str, Any]] | None = None
         self.last_rate_limit: dict[str, Any] | None = None
 
-    def _get_states(self) -> requests.Response:
+    def _get_states(self, *, _retried: bool = False) -> requests.Response:
         response = requests.get(
             OPENSKY_STATES_URL,
             params=self.params,
@@ -1071,6 +1076,10 @@ class OpenSkyClient:
             timeout=30,
         )
         self.last_rate_limit = parse_rate_limit_headers(response)
+        # Official docs: 401 means the access token expired — fetch a new one and retry.
+        if response.status_code == 401 and not _retried:
+            self.tokens.invalidate()
+            return self._get_states(_retried=True)
         if response.status_code == 429:
             retry = (self.last_rate_limit or {}).get("retry_after_seconds")
             raise RuntimeError(
